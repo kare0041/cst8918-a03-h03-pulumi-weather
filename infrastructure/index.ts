@@ -3,6 +3,9 @@ import * as containerregistry from '@pulumi/azure-native/containerregistry'
 import * as pulumi from "@pulumi/pulumi";
 import * as dockerBuild from '@pulumi/docker-build'
 import * as containerinstance from '@pulumi/azure-native/containerinstance'
+import * as redis from '@pulumi/azure-native/redis'
+
+
 // Import the configuration settings for the current stack.
 const config = new pulumi.Config()
 const appPath = config.require('appPath')
@@ -16,8 +19,39 @@ const publicPort = config.requireNumber('publicPort')
 const cpu = config.requireNumber('cpu')
 const memory = config.requireNumber('memory')
 
+
+
+
 // Create a resource group.
 const resourceGroup = new resources.ResourceGroup(`${prefixName}rg`)
+
+// Create a managed Redis service
+const cache = new redis.Redis(`${prefixName}-redis`, {
+  name: `${prefixName}-weather-cache`,
+  location: 'westus3',
+  resourceGroupName: resourceGroup.name,
+  enableNonSslPort: true,
+  redisVersion: 'Latest',
+  minimumTlsVersion: '1.2',
+  redisConfiguration: {
+    maxmemoryPolicy: 'allkeys-lru'
+  },
+  sku: {
+    name: 'Basic',
+    family: 'C',
+    capacity: 0
+  }
+})
+
+// Extract the auth creds from the deployed Redis service
+const redisAccessKey = redis
+  .listRedisKeysOutput({ name: cache.name, resourceGroupName: resourceGroup.name })
+  .apply((keys) => keys.primaryKey)
+
+
+// Construct the Redis connection string to be passed as an environment variable in the app container
+const redisConnectionString = pulumi.interpolate`rediss://:${redisAccessKey}@${cache.hostName}:${cache.sslPort}`
+
 
 // Create the container registry.
 const registry = new containerregistry.Registry(`${prefixName}ACR`, {
@@ -61,6 +95,7 @@ const image = new dockerBuild.Image(`${prefixName}-image`, {
   ],
 })
 
+
 // Create a container group in the Azure Container App service and make it publicly accessible.
 const containerGroup = new containerinstance.ContainerGroup(
   `${prefixName}-container-group`,
@@ -92,7 +127,11 @@ const containerGroup = new containerinstance.ContainerGroup(
           },
           {
             name: 'WEATHER_API_KEY',
-            value: '6117e4ec514f64368fa7affcdbcbb2a0',
+            value: config.requireSecret('weatherApiKey')
+          },
+          {
+            name: 'REDIS_URL',
+            value: redisConnectionString
           },
         ],
         resources: {
@@ -121,3 +160,5 @@ export const ip = containerGroup.ipAddress.apply((addr) => addr!.ip!)
 export const url = containerGroup.ipAddress.apply(
   (addr) => `http://${addr!.fqdn!}:${containerPort}`,
 )
+
+
